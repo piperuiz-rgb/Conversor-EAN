@@ -4,86 +4,87 @@ import re
 import io
 import os
 
-st.set_page_config(page_title="RGB - Conversor Gextia", page_icon="🔄")
+# CONFIGURACIÓN RÁPIDA
+st.set_page_config(page_title="Conversor RGB", layout="centered")
 
-# Estilos minimalistas para evitar carga innecesaria
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stButton>button { width: 100%; border-radius: 0px; height: 3em; background-color: #000; color: #fff; }
-    </style>
-    """, unsafe_allow_html=True)
-
-st.title("🔄 Conversor Gextia a EAN")
-st.info("Sube tu catálogo y el informe de ventas para obtener un Excel limpio con EANs.")
-
-# 1. CARGA DEL CATÁLOGO
-cat_file = st.file_uploader("1. Sube tu CATALOGUE.xlsx", type=['xlsx'])
-
+# 1. CARGA DEL CATÁLOGO (Se ejecuta solo una vez al arrancar)
 @st.cache_data
-def process_catalog(file):
-    df = pd.read_excel(file, engine='openpyxl')
-    df.columns = [str(c).strip() for c in df.columns]
-    # Creamos la llave maestra: REF_COLOR_TALLA
-    df['KEY'] = (df['Referencia'].astype(str).str.strip().str.upper() + "_" + 
-                 df['Color'].astype(str).str.strip().str.upper() + "_" + 
-                 df['Talla'].astype(str).str.strip().str.upper())
-    return df[['KEY', 'EAN']]
+def load_catalog_fast():
+    archivo = "catalogue.xlsx"
+    if os.path.exists(archivo):
+        df = pd.read_excel(archivo, engine='openpyxl')
+        # Limpieza de nombres de columnas
+        df.columns = [str(c).strip() for c in df.columns]
+        # Crear la llave de búsqueda (REF_COL_TAL)
+        df['KEY_MASTER'] = (df['Referencia'].astype(str).str.strip().str.upper() + "_" + 
+                            df['Color'].astype(str).str.strip().str.upper() + "_" + 
+                            df['Talla'].astype(str).str.strip().str.upper())
+        # Solo nos quedamos con la llave y el EAN para que pese poco en memoria
+        return df[['KEY_MASTER', 'EAN']]
+    return None
 
-if cat_file:
-    df_cat = process_catalog(cat_file)
-    st.success("✅ Catálogo cargado correctamente.")
+df_cat = load_catalog_fast()
 
-    # 2. CARGA DEL INFORME SUCIO
+st.title("🔄 Conversor Gextia")
+
+# Verificamos si el catálogo se leyó correctamente
+if df_cat is not None:
+    st.success(f"✅ Catálogo listo ({len(df_cat)} referencias cargadas)")
+    
     st.write("---")
-    ventas_file = st.file_uploader("2. Sube el informe de VENTAS (Gextia)", type=['xlsx'])
+    st.subheader("Subir Ventas de Gextia")
+    # Este es el único archivo que vas a subir tú
+    archivo_sucio = st.file_uploader("Sube el Excel con descripciones largas", type=['xlsx'])
 
-    if ventas_file:
-        df_v = pd.read_excel(ventas_file)
-        cols = df_v.columns.tolist()
+    if archivo_sucio:
+        df_v = pd.read_excel(archivo_sucio)
         
+        # Selección de columnas (Gextia suele llamar EAN a la descripción)
         c1, c2 = st.columns(2)
-        col_txt = c1.selectbox("Columna con [REF]... (COL, TAL)", cols)
-        col_cant = c2.selectbox("Columna Cantidad", cols)
+        col_txt = c1.selectbox("Columna con [REF]...", df_v.columns)
+        col_cant = c2.selectbox("Columna con Cantidad", df_v.columns)
 
-        if st.button("GENERAR EXCEL LIMPIO"):
-            with st.spinner("Procesando..."):
-                # Función de extracción optimizada
-                def parse_gextia(text):
-                    text = str(text)
-                    r = re.search(r'\[(.*?)\]', text)
-                    s = re.findall(r'\((.*?)\)', text)
-                    if r and s:
-                        ref = r.group(1).strip().upper()
-                        parts = s[-1].split(',')
-                        if len(parts) >= 2:
-                            return f"{ref}_{parts[0].strip().upper()}_{parts[1].strip().upper()}"
+        if st.button("LIMPIAR Y CONVERTIR", type="primary"):
+            # Lógica ultra-rápida para evitar que el navegador se desconecte (Axios Error)
+            try:
+                def extraer_key(t):
+                    t = str(t)
+                    ref = re.search(r'\[(.*?)\]', t)
+                    specs = re.findall(r'\((.*?)\)', t)
+                    if ref and specs:
+                        r = ref.group(1).strip().upper()
+                        partes = specs[-1].split(',')
+                        if len(partes) >= 2:
+                            return f"{r}_{partes[0].strip().upper()}_{partes[1].strip().upper()}"
                     return None
 
-                # Creamos la columna de cruce en el excel de ventas
-                df_v['JOIN_KEY'] = df_v[col_txt].apply(parse_gextia)
+                # Procesamiento por bloques (vectorizado)
+                df_v['JOIN_KEY'] = df_v[col_txt].apply(extraer_key)
+                
+                # Unir tablas (Merge)
+                res = pd.merge(df_v, df_cat, left_on='JOIN_KEY', right_on='KEY_MASTER', how='inner')
 
-                # Cruzamos con el catálogo (MERGE es mucho más rápido que un bucle for)
-                df_final = pd.merge(df_v, df_cat, left_on='JOIN_KEY', right_on='KEY', how='inner')
-
-                if not df_final.empty:
-                    # Resultado final: EAN y Cantidad
-                    resultado = df_final[['EAN', col_cant]].rename(columns={col_cant: 'Cantidad'})
+                if not res.empty:
+                    # Formato para la App de Peticiones
+                    final = res[['EAN', col_cant]].rename(columns={col_cant: 'Cantidad'})
                     
-                    st.success(f"📦 Se han convertido {len(resultado)} líneas con éxito.")
-                    st.dataframe(resultado.head(10), use_container_width=True)
-
-                    # Preparar descarga
+                    st.success(f"✅ ¡Hecho! {len(final)} líneas identificadas.")
+                    
+                    # Preparar el botón de descarga
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        resultado.to_excel(writer, index=False)
+                        final.to_excel(writer, index=False)
                     
                     st.download_button(
-                        label="📥 DESCARGAR EXCEL PARA PETICIONES",
+                        label="📥 BAJAR EXCEL PARA PETICIONES",
                         data=output.getvalue(),
-                        file_name="ean_limpios_para_peticiones.xlsx",
+                        file_name="ean_listos.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.error("No se encontraron coincidencias. Verifica que el catálogo y el informe tengan las mismas Referencias/Colores/Tallas.")
-                  
+                    st.error("No se encontró ninguna coincidencia. Revisa si el catálogo tiene las mismas tallas/colores.")
+            except Exception as e:
+                st.error(f"Error técnico: {e}")
+else:
+    st.error("❌ No encuentro el archivo 'catalogue.xlsx' en GitHub. Asegúrate de que el nombre sea exacto y esté en la misma carpeta.")
+
