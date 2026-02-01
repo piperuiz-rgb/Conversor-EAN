@@ -4,75 +4,76 @@ import re
 import io
 import os
 
-st.set_page_config(page_title="Conversor RGB - Gextia", layout="centered")
+# Deshabilitamos elementos visuales innecesarios para ahorrar ancho de banda
+st.set_page_config(page_title="Conversor Fast", layout="centered")
 
 @st.cache_data(show_spinner=False)
-def load_cat():
+def load_db():
     if os.path.exists("catalogue.xlsx"):
         df = pd.read_excel("catalogue.xlsx", engine='openpyxl')
+        # Forzamos limpieza de nombres de columnas
         df.columns = [str(c).strip() for c in df.columns]
-        # Creamos la llave maestra uniendo Ref, Color y Talla del catálogo
-        df['KEY_MASTER'] = (df['Referencia'].astype(str).str.strip().str.upper() + "_" + 
-                            df['Color'].astype(str).str.strip().str.upper() + "_" + 
-                            df['Talla'].astype(str).str.strip().str.upper())
-        # Nos quedamos con la llave y el EAN REAL
-        return df[['KEY_MASTER', 'EAN']]
+        # Crear KEY única
+        df['KEY'] = (df['Referencia'].astype(str).str.strip().str.upper() + "_" + 
+                     df['Color'].astype(str).str.strip().str.upper() + "_" + 
+                     df['Talla'].astype(str).str.strip().str.upper())
+        # Mantenemos solo lo mínimo necesario en memoria
+        return df[['KEY', 'EAN']].set_index('KEY')
     return None
 
-df_cat = load_cat()
+db = load_db()
 
 st.title("🔄 Conversor Gextia")
 
-if df_cat is not None:
-    st.success(f"✅ Catálogo listo: {len(df_cat)} referencias.")
-    
-    archivo_v = st.file_uploader("Sube el Excel de Gextia (2 columnas: EAN y Cantidad)", type=['xlsx'])
+if db is not None:
+    # El cargador de archivos es el punto crítico del AxiosError
+    archivo = st.file_uploader("Sube el Excel sucio", type=['xlsx'], key="f_up")
 
-    if archivo_v:
-        df_v = pd.read_excel(archivo_v)
-        
-        # Forzamos a que use las columnas que me has dicho
-        # Si no se llaman exactamente así, el código las busca por posición
-        col_sucio = "EAN" if "EAN" in df_v.columns else df_v.columns[0]
-        col_cant = "Cantidad" if "Cantidad" in df_v.columns else df_v.columns[1]
-
-        if st.button("LIMPIAR Y CONVERTIR"):
-            def procesar_texto_sucio(t):
-                t = str(t)
-                # Extraer [REFERENCIA]
-                ref = re.search(r'\[(.*?)\]', t)
-                # Extraer (COLOR, TALLA)
-                specs = re.findall(r'\((.*?)\)', t)
+    if archivo:
+        # Botón para disparar la lógica sin previsualizar nada antes
+        if st.button("PROCESAR Y DESCARGAR"):
+            try:
+                # Leemos el archivo sucio
+                df_v = pd.read_excel(archivo)
                 
-                if ref and specs:
-                    r = ref.group(1).strip().upper()
-                    partes = specs[-1].split(',')
-                    if len(partes) >= 2:
-                        c = partes[0].strip().upper()
-                        talla = partes[1].strip().upper()
-                        return f"{r}_{c}_{talla}"
-                return None
+                # Identificamos columnas por posición (0=EAN sucio, 1=Cantidad)
+                # Esto evita errores si los nombres de columna varían
+                col_txt = df_v.columns[0]
+                col_can = df_v.columns[1]
 
-            # Aplicar limpieza rápida
-            df_v['LLAVE_CRUCE'] = df_v[col_sucio].apply(procesar_texto_sucio)
+                def limpiar(t):
+                    t = str(t)
+                    r = re.search(r'\[(.*?)\]', t)
+                    s = re.findall(r'\((.*?)\)', t)
+                    if r and s:
+                        p = s[-1].split(',')
+                        if len(p) >= 2:
+                            return f"{r.group(1).strip().upper()}_{p[0].strip().upper()}_{p[1].strip().upper()}"
+                    return None
+
+                # Creamos la columna de cruce
+                df_v['JOIN'] = df_v[col_txt].apply(limpiar)
+                
+                # Cruce ultra-rápido usando el índice del catálogo
+                # Esto es lo más eficiente en memoria/red
+                df_v = df_v.join(db, on='JOIN', how='inner', rsuffix='_REAL')
+
+                if not df_v.empty:
+                    # Preparamos el resultado final
+                    res = df_v[['EAN_REAL', col_can]].rename(columns={'EAN_REAL': 'EAN', col_can: 'Cantidad'})
+                    
+                    # Generamos el Excel en memoria
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                        res.to_excel(writer, index=False)
+                    
+                    st.success("✅ Conversión completada.")
+                    st.download_button("📥 DESCARGAR AHORA", out.getvalue(), "ean_limpios.xlsx", use_container_width=True)
+                else:
+                    st.warning("⚠️ No se encontraron coincidencias. Revisa el catálogo.")
             
-            # Cruzar con el catálogo para obtener el EAN de verdad
-            resultado = pd.merge(df_v, df_cat, left_on='LLAVE_CRUCE', right_on='KEY_MASTER', how='inner')
-
-            if not resultado.empty:
-                # El resultado final tendrá el EAN real del catálogo y la cantidad
-                # Renombramos el EAN del catálogo para que no choque con el nombre de la columna sucia
-                df_final = resultado[['EAN_y', col_cant]].rename(columns={'EAN_y': 'EAN', col_cant: 'Cantidad'})
-                
-                st.success(f"✅ Procesadas {len(df_final)} líneas con éxito.")
-                
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_final.to_excel(writer, index=False)
-                
-                st.download_button("📥 DESCARGAR EXCEL PARA PETICIONES", output.getvalue(), "ean_limpios.xlsx")
-            else:
-                st.error("No se encontraron coincidencias. Revisa si los nombres de Color/Talla en el catálogo coinciden con el texto del paréntesis.")
+            except Exception as e:
+                st.error(f"Error en proceso: {e}")
 else:
-    st.error("⚠️ No encuentro 'catalogue.xlsx' en la carpeta de la App.")
+    st.error("❌ No se encontró catalogue.xlsx")
     
